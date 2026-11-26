@@ -85,6 +85,7 @@ MiniDumpWriteDumpFn g_writeDump = nullptr;
 HANDLE g_crashRequestEvent = nullptr;
 HANDLE g_crashDoneEvent = nullptr;
 HANDLE g_crashWorkerThread = nullptr;
+std::atomic<DWORD> g_crashWorkerThreadId{0};
 std::atomic<bool> g_crashWorkerStop{false};
 std::atomic<bool> g_inCrashHandler{false};
 LPTOP_LEVEL_EXCEPTION_FILTER g_prevUnhandledFilter = nullptr;
@@ -282,6 +283,8 @@ DWORD WINAPI StandaloneDumpThreadProc(LPVOID)
 
 void ProcessCrashRequest()
 {
+    if (const EmergencyRestoreFn restore = g_emergencyRestore.load(std::memory_order_acquire))
+        restore();
     FlushLog(kLogFlushTimeoutMs);
 
     wchar_t dumpName[64]{};
@@ -323,13 +326,20 @@ void HandleFatalCrash(const wchar_t* reason, EXCEPTION_POINTERS* exceptionPointe
     ScopedActiveHandler activeHandler;
     if (g_handlerLifecycle.load(std::memory_order_seq_cst) != HandlerLifecycle::Running)
         return;
-    if (g_inCrashHandler.exchange(true, std::memory_order_acq_rel))
+    if (g_inCrashHandler.exchange(true, std::memory_order_acq_rel)) {
+        if (g_crashDoneEvent) {
+            if (GetCurrentThreadId() == g_crashWorkerThreadId.load(std::memory_order_acquire))
+                SetEvent(g_crashDoneEvent);
+            else
+                WaitForSingleObject(g_crashDoneEvent, kCrashWorkerTimeoutMs);
+        }
         return;
-    // Restore Windows' taskbar first on the faulting thread, then offload log flushing and dumping to the pre-allocated worker stack.
-    if (const EmergencyRestoreFn restore = g_emergencyRestore.load(std::memory_order_acquire))
-        restore();
-    if (!g_crashWorkerThread || !g_crashRequestEvent || !g_crashDoneEvent)
+    }
+    if (!g_crashWorkerThread || !g_crashRequestEvent || !g_crashDoneEvent) {
+        if (const EmergencyRestoreFn restore = g_emergencyRestore.load(std::memory_order_acquire))
+            restore();
         return;
+    }
 
     GetLocalTime(&g_crashRequest.localTime);
     g_crashRequest.pid = GetCurrentProcessId();
@@ -381,6 +391,7 @@ void PurecallHandler() { HandleNonSehFatal(L"crt-purecall", EXCEPTION_NONCONTINU
 void ReleaseCrashWorkerResources()
 {
     CloseAndClear(g_crashWorkerThread);
+    g_crashWorkerThreadId.store(0, std::memory_order_release);
     CloseAndClear(g_crashRequestEvent);
     CloseAndClear(g_crashDoneEvent);
     g_writeDump = nullptr;
@@ -462,8 +473,10 @@ void InstallCrashHandlers(EmergencyRestoreFn emergencyRestore)
     g_crashWorkerStop.store(false, std::memory_order_release);
     g_crashRequestEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_crashDoneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DWORD workerThreadId = 0;
     if (g_crashRequestEvent && g_crashDoneEvent)
-        g_crashWorkerThread = CreateThread(nullptr, kDumpThreadStackBytes, &CrashWorkerProc, nullptr, 0, nullptr);
+        g_crashWorkerThread = CreateThread(nullptr, kDumpThreadStackBytes, &CrashWorkerProc, nullptr, 0, &workerThreadId);
+    g_crashWorkerThreadId.store(g_crashWorkerThread ? workerThreadId : 0, std::memory_order_release);
     if (!g_crashWorkerThread) {
         Log(L"crash: worker unavailable (%lu); minidumps disabled", GetLastError());
         ReleaseCrashWorkerResources();

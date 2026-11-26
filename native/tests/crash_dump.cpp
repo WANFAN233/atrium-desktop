@@ -221,7 +221,7 @@ void TestWriteAndPruneCrashDump()
 
     const fs::path dumpPath = dir.path / newName;
     const std::string bytes = ReadBytes(dumpPath);
-    Require(bytes.size() >= 4 && bytes.compare(0, 4, "MDMP") == 0, "minidump must start with MDMP header");
+    Require(bytes.starts_with("MDMP"), "minidump must start with MDMP header");
     Require(!fs::exists(dir.path / MakeDumpName(36)) && fs::exists(dir.path / MakeDumpName(37)) && fs::exists(dumpPath),
             "newest 5 crash dumps must remain after new dump");
 
@@ -294,7 +294,10 @@ void TestFlushLog()
     const std::wstring emergencyMarker = L"crash_dump_test_emergency_" + std::to_wstring(GetCurrentProcessId());
     atrium::Log(L"%s", marker.c_str());
 
-    const fs::path coreLogPath = fs::path(atrium::DataDirectory()) / L"logs" / L"core.log";
+    const fs::path logsDir = fs::path(atrium::DataDirectory()) / L"logs";
+    std::error_code ec;
+    fs::create_directories(logsDir, ec);
+    const fs::path coreLogPath = logsDir / L"core.log";
     std::thread logger([&workerMarker] {
         for (int i = 0; i < 10; ++i)
             atrium::Log(L"%s_%d", workerMarker.c_str(), i);

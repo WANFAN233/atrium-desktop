@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
-#include <share.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -89,32 +88,66 @@ bool FlushLogImpl(unsigned long timeoutMs)
     return g_flushState.flushedOkSeq.load(std::memory_order_acquire) >= target;
 }
 
-bool WriteLogBatch(FILE*& file, const std::wstring& path, const std::wstring& backup, unsigned long long& written, unsigned long long maxBytes,
+HANDLE OpenLogFile(const std::wstring& path)
+{
+    return CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                       nullptr);
+}
+
+bool WriteAll(HANDLE file, const char* data, size_t size)
+{
+    constexpr size_t kMaxChunk = 1ULL << 20;
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t remaining = size - offset;
+        const DWORD chunk = static_cast<DWORD>(remaining < kMaxChunk ? remaining : kMaxChunk);
+        DWORD bytesWritten = 0;
+        if (!WriteFile(file, data + offset, chunk, &bytesWritten, nullptr) || bytesWritten == 0)
+            return false;
+        offset += bytesWritten;
+    }
+    return true;
+}
+
+bool WriteLogBatch(HANDLE& file, const std::wstring& path, const std::wstring& backup, unsigned long long& written, unsigned long long maxBytes,
                    const std::vector<std::wstring>& lines)
 {
-    if (!file)
-        return false;
+    if (file == INVALID_HANDLE_VALUE) {
+        file = OpenLogFile(path);
+        if (file == INVALID_HANDLE_VALUE)
+            return false;
+        LARGE_INTEGER size{};
+        written = GetFileSizeEx(file, &size) && size.QuadPart > 0 ? static_cast<unsigned long long>(size.QuadPart) : 0;
+    }
     bool ok = true;
+    std::string utf8;
     for (const std::wstring& l : lines) {
-        if (fputws(l.c_str(), file) == WEOF) {
-            ok = false;
-            continue;
-        }
-        const int bytes = WideCharToMultiByte(CP_UTF8, 0, l.data(), static_cast<int>(l.size()), nullptr, 0, nullptr, nullptr);
-        if (bytes > 0)
-            written += static_cast<unsigned>(bytes);
-        if (written > maxBytes) {
-            if (fflush(file) != 0)
+        if (!l.empty()) {
+            const int bytes = WideCharToMultiByte(CP_UTF8, 0, l.data(), static_cast<int>(l.size()), nullptr, 0, nullptr, nullptr);
+            if (bytes <= 0) {
                 ok = false;
-            fclose(file);
+                continue;
+            }
+            const size_t prev = utf8.size();
+            utf8.resize(prev + static_cast<size_t>(bytes));
+            WideCharToMultiByte(CP_UTF8, 0, l.data(), static_cast<int>(l.size()), utf8.data() + prev, bytes, nullptr, nullptr);
+            written += static_cast<unsigned long long>(bytes);
+        }
+        if (written > maxBytes) {
+            if (!utf8.empty()) {
+                if (!WriteAll(file, utf8.data(), utf8.size()))
+                    ok = false;
+                utf8.clear();
+            }
+            CloseHandle(file);
             MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING);
-            file = _wfsopen(path.c_str(), L"a, ccs=UTF-8", _SH_DENYNO);
+            file = OpenLogFile(path);
             written = 0;
-            if (!file)
+            if (file == INVALID_HANDLE_VALUE)
                 return false;
         }
     }
-    if (fflush(file) != 0)
+    if (!utf8.empty() && !WriteAll(file, utf8.data(), utf8.size()))
         ok = false;
     return ok;
 }
@@ -226,9 +259,8 @@ private:
             else
                 written = size;
         }
-        FILE* f = _wfsopen(path.c_str(), L"a, ccs=UTF-8", _SH_DENYNO); // others may read it meanwhile
+        HANDLE f = OpenLogFile(path); // kernel FILE_APPEND_DATA avoids races with concurrent readers and emergency crash appends
         std::vector<std::wstring> lines;
-        bool anyBatchFailed = false;
         for (;;) {
             size_t dropped = 0;
             uint64_t batchSeq = 0;
@@ -252,15 +284,13 @@ private:
             }
             const bool batchOk = WriteLogBatch(f, path, backup, written, kMaxBytes, lines);
             lines.clear();
-            if (!batchOk)
-                anyBatchFailed = true;
-            else if (!anyBatchFailed)
+            if (batchOk)
                 g_flushState.flushedOkSeq.store(batchSeq, std::memory_order_release);
             g_flushState.processedSeq.store(batchSeq, std::memory_order_release);
             SignalWakeEvent();
         }
-        if (f)
-            fclose(f);
+        if (f != INVALID_HANDLE_VALUE)
+            CloseHandle(f);
         g_flushState.exited.store(true, std::memory_order_release);
         SignalWakeEvent();
     }
